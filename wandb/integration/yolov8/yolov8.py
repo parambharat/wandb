@@ -1,12 +1,22 @@
-from typing import Any, Callable, Dict, List, Optional
+"""
+Yolov8 integration for Weights & Biases
+"""
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import torch
 from ultralytics.yolo.engine.model import YOLO
 from ultralytics.yolo.engine.trainer import BaseTrainer
+from ultralytics.yolo.engine.validator import BaseValidator
 from ultralytics.yolo.utils import RANK
+from ultralytics.yolo.utils.plotting import output_to_target
 from ultralytics.yolo.utils.torch_utils import get_flops, get_num_params
 from ultralytics.yolo.v8.classify.train import ClassificationTrainer
+from ultralytics.yolo.v8.detect import DetectionValidator
+from ultralytics.yolo.v8.segment import SegmentationValidator
 
 import wandb
+from wandb.integration.yolov8.utils import convert_to_wb_images
 from wandb.sdk.lib import telemetry
 
 
@@ -48,6 +58,8 @@ class WandbCallback:
         self.tags = tags
         self.resume = resume
         self.kwargs = kwargs
+        self.og_plot_predictions: Union[None, Callable] = None
+        self.validation_table: Union[None, wandb.Table] = None
 
     def on_pretrain_routine_start(self, trainer: BaseTrainer) -> None:
         """Starts a new wandb run to track the training process and log to Weights & Biases.
@@ -184,6 +196,41 @@ class WandbCallback:
         self.run.finish()
         self.run = None
 
+    def on_val_start(
+        self,
+        validator: BaseValidator,
+    ) -> None:
+        """On validation start we create a wandb table to store the sample predictions
+        and patch the validator's `plot_predictions` method to plot the predictions to the wandb table .
+        """
+        class_names = sorted(validator.names.values())
+        if isinstance(validator, DetectionValidator):
+            self.validation_table = wandb.Table(
+                columns=["Batch", "Ground Truth", "Prediction", *class_names]
+            )
+            self.og_plot_predictions = validator.plot_predictions
+            validator.plot_predictions = partial(
+                plot_detection_predictions, self, validator
+            )
+
+        if isinstance(validator, SegmentationValidator):
+            self.validation_table = wandb.Table(
+                columns=["Batch", "Ground Truth", "Prediction", *class_names]
+            )
+            self.og_plot_predictions = validator.plot_predictions
+            validator.plot_predictions = partial(
+                plot_segmentation_predictions, self, validator
+            )
+
+    def on_val_end(self, validator: BaseValidator) -> None:
+        """On validation end we log the validation table and unpatch the validator's `plot_predictions` method."""
+        if self.validation_table is not None:
+            self.run.log({"sample_predictions": self.validation_table})
+        if self.og_plot_predictions is not None:
+            validator.plot_predictions = self.og_plot_predictions
+            self.og_plot_predictions = None
+            self.validation_table = None
+
     @property
     def callbacks(
         self,
@@ -198,7 +245,78 @@ class WandbCallback:
             "on_train_end": self.on_train_end,
             "on_model_save": self.on_model_save,
             "teardown": self.teardown,
+            "on_val_start": self.on_val_start,
+            "on_val_end": self.on_val_end,
         }
+
+
+def add_images_to_validation_table(
+    logger: WandbCallback,
+    validator: BaseValidator,
+    images: List[Tuple[wandb.Image, wandb.Image]],
+    scores: List[Dict[str, float]],
+    batch_id: int,
+) -> None:
+    """Utility to add a wandb.Image, predictions and scores to the validation table"""
+    objects = sorted(validator.names.values())
+    for item in scores:
+        for obj in objects:
+            if obj not in item:
+                item[obj] = 0.0
+    for im, score in zip(
+        images,
+        scores,
+    ):
+        if logger.validation_table is not None:
+            logger.validation_table.add_data(
+                batch_id,
+                *im,
+                *map(lambda x: x[1], sorted(score.items(), key=lambda x: x[0])),
+            )
+
+
+def plot_detection_predictions(
+    logger: WandbCallback,
+    validator: BaseValidator,
+    batch: Dict[str, Any],
+    predictions: Any,
+    batch_id: int,
+) -> None:
+    """Utility to plot predictions from the `DetectionValidator` to a wandb.Table"""
+    (batch_idx, cls, bboxes) = output_to_target(predictions, max_det=15)
+    wb_images, scores = convert_to_wb_images(
+        batch=batch,
+        batch_idx=batch_idx,
+        cls=cls,
+        bboxes=bboxes,
+        masks=None,
+        names=validator.names,
+    )
+
+    add_images_to_validation_table(logger, validator, wb_images, scores, batch_id)
+
+
+def plot_segmentation_predictions(
+    logger: WandbCallback,
+    validator: BaseValidator,
+    batch: Dict[str, Any],
+    predictions: Any,
+    ni: int,
+) -> None:
+    """Utility to plot predictions from the `SegmentationValidator` to a wandb.Table"""
+    (batch_idx, cls, bboxes) = output_to_target(predictions[0], max_det=15)
+    wb_images, scores = convert_to_wb_images(
+        batch=batch,
+        batch_idx=batch_idx,
+        cls=cls,
+        bboxes=bboxes,
+        masks=torch.cat(validator.plot_masks, dim=0)
+        if len(validator.plot_masks)
+        else validator.plot_masks,
+        names=validator.names,
+    )
+    validator.plot_masks.clear()
+    add_images_to_validation_table(logger, validator, wb_images, scores, ni)
 
 
 def add_callbacks(
