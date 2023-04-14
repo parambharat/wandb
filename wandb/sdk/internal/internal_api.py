@@ -30,16 +30,16 @@ from typing import (
 import click
 import requests
 import yaml
-from wandb_gql import Client, gql  # type: ignore
-from wandb_gql.client import RetryError  # type: ignore
-from wandb_gql.transport.requests import RequestsHTTPTransport  # type: ignore
+from wandb_gql import Client, gql
+from wandb_gql.client import RetryError
 
 import wandb
 from wandb import __version__, env, util
-from wandb.apis.normalize import normalize_exceptions
+from wandb.apis.normalize import normalize_exceptions, parse_backend_error_messages
 from wandb.errors import CommError, UsageError
 from wandb.integration.sagemaker import parse_sm_secrets
 from wandb.old.settings import Settings
+from wandb.sdk.lib.gql_request import GraphQLSession
 from wandb.sdk.lib.hashutil import B64MD5, md5_file_b64
 
 from ..lib import retry
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
         api_key: Optional[str]
         entity: Optional[str]
         project: Optional[str]
+        _extra_http_headers: Optional[Mapping[str, str]]
 
     _Response = MutableMapping
     SweepState = Literal["RUNNING", "PAUSED", "CANCELED", "FINISHED"]
@@ -178,6 +179,7 @@ class Api:
             "api_key": None,
             "entity": None,
             "project": None,
+            "_extra_http_headers": None,
         }
         self.retry_timedelta = retry_timedelta
         # todo: Old Settings do not follow the SupportsKeysAndGetItem Protocol
@@ -194,12 +196,22 @@ class Api:
             "system_samples": 15,
             "heartbeat_seconds": 30,
         }
+
+        # todo: remove this hacky hack after settings refactor is complete
+        #  keeping this code here to limit scope and so that it is easy to remove later
+        extra_http_headers = self.settings(
+            "_extra_http_headers"
+        ) or wandb.sdk.wandb_settings._str_as_dict(
+            self._environ.get("WANDB__EXTRA_HTTP_HEADERS", {})
+        )
+
         self.client = Client(
-            transport=RequestsHTTPTransport(
+            transport=GraphQLSession(
                 headers={
                     "User-Agent": self.user_agent,
                     "X-WANDB-USERNAME": env.get_username(env=self._environ),
                     "X-WANDB-USER-EMAIL": env.get_user_email(env=self._environ),
+                    **extra_http_headers,
                 },
                 use_json=True,
                 # this timeout won't apply when the DNS lookup fails. in that case, it will be 60s
@@ -272,28 +284,12 @@ class Api:
         try:
             return self.client.execute(*args, **kwargs)  # type: ignore
         except requests.exceptions.HTTPError as err:
-            res = err.response
-            logger.error(f"{res.status_code} response executing GraphQL.")
-            logger.error(res.text)
-            self.display_gorilla_error_if_found(res)
+            response = err.response
+            logger.error(f"{response.status_code} response executing GraphQL.")
+            logger.error(response.text)
+            for error in parse_backend_error_messages(response):
+                wandb.termerror(f"Error while calling W&B API: {error} ({response})")
             raise
-
-    def display_gorilla_error_if_found(self, res: requests.Response) -> None:
-        try:
-            data = res.json()
-        except ValueError:
-            return
-
-        if "errors" in data and isinstance(data["errors"], list):
-            for err in data["errors"]:
-                # Our tests and potentially some api endpoints return a string error?
-                if isinstance(err, str):
-                    err = {"message": err}
-                if not err.get("message"):
-                    continue
-                wandb.termerror(
-                    "Error while calling W&B API: {} ({})".format(err["message"], res)
-                )
 
     def disabled(self) -> Union[str, bool]:
         return self._settings.get(Settings.DEFAULT_SECTION, "disabled", fallback=False)  # type: ignore
@@ -2126,7 +2122,7 @@ class Api:
                 _e = retry.TransientError(exc=e)
                 raise _e.with_traceback(sys.exc_info()[2])
             else:
-                util.sentry_reraise(e)
+                wandb._sentry.reraise(e)
 
         return response
 
@@ -2285,7 +2281,7 @@ class Api:
 
     def agent_heartbeat(
         self, agent_id: str, metrics: dict, run_states: dict
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """Notify server about agent state, receive commands.
 
         Arguments:
@@ -2335,7 +2331,9 @@ class Api:
             logger.error("Error communicating with W&B: %s", message)
             return []
         else:
-            result: List[str] = json.loads(response["agentHeartbeat"]["commands"])
+            result: List[Dict[str, Any]] = json.loads(
+                response["agentHeartbeat"]["commands"]
+            )
             return result
 
     @staticmethod
@@ -2477,18 +2475,22 @@ class Api:
         err: Optional[Exception] = None
         for mutation in mutations:
             try:
+                variables = {
+                    "id": obj_id,
+                    "config": yaml.dump(config),
+                    "description": config.get("description"),
+                    "entityName": entity or self.settings("entity"),
+                    "projectName": project or self.settings("project"),
+                    "controller": controller,
+                    "launchScheduler": launch_scheduler,
+                    "scheduler": scheduler,
+                }
+                if state:
+                    variables["state"] = state
+
                 response = self.gql(
                     mutation,
-                    variable_values={
-                        "id": obj_id,
-                        "config": yaml.dump(config),
-                        "description": config.get("description"),
-                        "entityName": entity or self.settings("entity"),
-                        "projectName": project or self.settings("project"),
-                        "controller": controller,
-                        "launchScheduler": launch_scheduler,
-                        "scheduler": scheduler,
-                    },
+                    variable_values=variables,
                     check_retry_fn=util.no_retry_4xx,
                 )
             except UsageError as e:
@@ -3386,3 +3388,32 @@ class Api:
     def _flatten_edges(self, response: "_Response") -> List[Dict]:
         """Return an array from the nested graphql relay structure."""
         return [node["node"] for node in response["edges"]]
+
+    @normalize_exceptions
+    def stop_run(
+        self,
+        run_id: str,
+    ) -> bool:
+        mutation = gql(
+            """
+            mutation stopRun($id: ID!) {
+                stopRun(input: {
+                    id: $id
+                }) {
+                    clientMutationId
+                    success
+                }
+            }
+            """
+        )
+
+        response = self.gql(
+            mutation,
+            variable_values={
+                "id": run_id,
+            },
+        )
+
+        success: bool = response["stopRun"].get("success")
+
+        return success
